@@ -23,7 +23,7 @@ from typing import Literal, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.nvgpu import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync
 from cutlass.cute.typing import AddressSpace, Pointer
 from cutlass.cutlass_dsl import dsl_user_op, Int32, extract_mlir_values, new_from_mlir_values
 from cutlass._mlir import ir
@@ -183,6 +183,10 @@ def tensormap_ptr_for_copy(raw_ptr: Pointer, *, loc=None, ip=None) -> Pointer:
     :rtype: Pointer
     """
     generic_ptr = gmem_ptr_to_generic(raw_ptr, loc=loc, ip=ip)
+    # Kernel/stream ordering does not invalidate the tensormap proxy. Acquire
+    # descriptors written by the helper kernel before TMA reads them, including
+    # when sequential calls reuse workspace addresses during CUDA Graph replay.
+    cpasync.fence_tma_desc_acquire(generic_ptr, loc=loc, ip=ip)
     tma_desc_ptr_ty = _cute_ir.PtrType.get(
         _cute_nvgpu_ir.TmaDescriptorTiledType.get(),
         generic_ptr.memspace,

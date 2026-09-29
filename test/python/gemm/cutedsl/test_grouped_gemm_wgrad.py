@@ -836,58 +836,202 @@ def test_grouped_gemm_wgrad_wrapper_dynamic_tokens_cache_behavior(monkeypatch, o
     assert cache_entries == 1
 
 
-@pytest.mark.L0
-@pytest.mark.parametrize(
-    ("caller_owned_workspace", "expected_cache_entries"),
-    [(False, 2), (True, 1)],
-    ids=["compatibility-isolation", "caller-workspace"],
-)
-def test_grouped_gemm_wgrad_wrapper_explicit_dense_output_cache(
-    monkeypatch,
-    caller_owned_workspace,
-    expected_cache_entries,
-):
-    from cudnn.gemm.cutedsl.grouped.wgrad import api as grouped_gemm_wgrad_api
-
-    grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
-    compile_count = {"value": 0}
-
-    def counted_compile(self):
-        compile_count["value"] += 1
-
-    monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "check_support", lambda self: True)
-    monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "compile", counted_compile)
-    monkeypatch.setattr(grouped_gemm_wgrad_api.GroupedGemmWgradSm100, "execute", lambda self, **kwargs: None)
-    monkeypatch.setattr(
-        grouped_gemm_wgrad_api,
-        "select_grouped_gemm_backend",
-        lambda **_: grouped_gemm_wgrad_api.GroupedGemmBackend.BLOCK_SCALED,
+def _make_wgrad_capture_inputs(a_value=1, group_k_list=(256, 256), hidden=128, intermediate=128):
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM WGrad MXFP8 kernel.")
+    # Exact integer operands and unit scales give an independent, exact reference
+    # on both Blackwell and Rubin, without using torch's grouped GEMM kernels.
+    row_signs = (torch.arange(hidden, device="cuda") % 2 * 2 - 1).float()
+    col_signs = (torch.arange(intermediate, device="cuda") % 2 * 2 - 1).float()
+    a = (a_value * row_signs[:, None]).expand(hidden, 512).contiguous().to(torch.float8_e4m3fn)
+    b = col_signs[:, None].expand(intermediate, 512).contiguous().to(torch.float8_e4m3fn).T
+    return dict(
+        a_tensor=a,
+        b_tensor=b,
+        sfa_tensor=torch.full((hidden, 16), 127, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu),
+        sfb_tensor=torch.full((intermediate, 16), 127, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu),
+        offsets_tensor=torch.tensor([group_k_list[0], sum(group_k_list)], dtype=torch.int32, device="cuda"),
     )
 
-    inputs = _make_wgrad_wrapper_cache_inputs([8, 12])
-    outputs = [torch.empty((2, 32, 64), dtype=torch.bfloat16) for _ in range(2)]
-    workspaces = [torch.empty(512, dtype=torch.uint8) for _ in range(2)]
-    try:
-        for output, workspace in zip(outputs, workspaces):
-            workspace_kwargs = {"descriptor_workspace": workspace} if caller_owned_workspace else {}
-            cudnn.grouped_gemm_wgrad_wrapper_sm100(
-                **inputs,
-                **workspace_kwargs,
-                output_mode="dense",
-                wgrad_tensor=output,
-                acc_dtype=torch.float32,
-                wgrad_dtype=torch.bfloat16,
-                mma_tiler_mn=(128, 128),
-                cluster_shape_mn=(1, 1),
-                sf_vec_size=16,
-            )
-    finally:
-        cache_entries = len(grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects)
-        grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
 
-    assert outputs[0].data_ptr() != outputs[1].data_ptr()
-    assert compile_count["value"] == expected_cache_entries
-    assert cache_entries == expected_cache_entries
+def _wgrad_capture_output_ptrs(output, output_mode):
+    if output_mode == "dense":
+        return None
+    # Discrete callers prepare the expert pointer table before capture.
+    return torch.tensor([expert.data_ptr() for expert in output], dtype=torch.int64, device=output.device)
+
+
+def _run_wgrad_capture(inputs, output, stream, workspace=None, output_mode="dense", output_ptrs=None):
+    return cudnn.grouped_gemm_wgrad_wrapper_sm100(
+        **inputs,
+        output_mode=output_mode,
+        wgrad_tensor=output,
+        wgrad_ptrs=output_ptrs,
+        acc_dtype=torch.float32,
+        wgrad_dtype=torch.bfloat16,
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        sf_vec_size=32,
+        input_order="tensor2d",
+        current_stream=stream.cuda_stream,
+        descriptor_workspace=workspace,
+    )
+
+
+def _assert_wgrad_capture_result(output, a_value, group_k_list):
+    row_signs = (torch.arange(output.shape[1], device=output.device) % 2 * 2 - 1).float()
+    col_signs = (torch.arange(output.shape[2], device=output.device) % 2 * 2 - 1).float()
+    outer = row_signs[:, None] * col_signs[None, :]
+    expected = torch.stack([outer * (a_value * tokens) for tokens in group_k_list]).to(output.dtype)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("caller_owned_workspace", [False, True], ids=["wrapper-workspace", "caller-workspace"])
+@pytest.mark.parametrize("output_mode", ["dense", "discrete"])
+def test_grouped_gemm_wgrad_wrapper_capture_fresh_output(caller_owned_workspace, output_mode):
+    """Warming one output must cover capture with another output allocation."""
+    inputs = _make_wgrad_capture_inputs()
+    warmup_output = torch.empty((2, 128, 128), dtype=torch.bfloat16, device="cuda")
+    captured_output = torch.full_like(warmup_output, float("nan"))
+    warmup_ptrs = _wgrad_capture_output_ptrs(warmup_output, output_mode)
+    captured_ptrs = _wgrad_capture_output_ptrs(captured_output, output_mode)
+    workspace = None
+    if caller_owned_workspace:
+        workspace = torch.empty(cudnn.get_grouped_gemm_wgrad_workspace_size_sm100(2, output_mode=output_mode), dtype=torch.uint8, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    # Initialize the compiler/runtime serially before exercising graph capture.
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            _run_wgrad_capture(inputs, warmup_output, stream, workspace, output_mode=output_mode, output_ptrs=warmup_ptrs)
+    stream.synchronize()
+    _assert_wgrad_capture_result(warmup_output, 1, (256, 256))
+    assert captured_output.data_ptr() != warmup_output.data_ptr()
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            _run_wgrad_capture(inputs, captured_output, stream, workspace, output_mode=output_mode, output_ptrs=captured_ptrs)
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_wgrad_capture_result(captured_output, 1, (256, 256))
+
+        # Replay must read current operands and expert boundaries, not the values
+        # used to construct the cached operator or the captured descriptors.
+        inputs["a_tensor"].copy_(inputs["a_tensor"].float() * 2)
+        inputs["offsets_tensor"].copy_(torch.tensor([128, 512], dtype=torch.int32, device="cuda"))
+        captured_output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_wgrad_capture_result(captured_output, 2, (128, 384))
+        _assert_wgrad_capture_result(warmup_output, 1, (256, 256))
+    finally:
+        graph.reset()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("output_mode", ["dense", "discrete"])
+def test_grouped_gemm_wgrad_wrapper_concurrent_graphs(output_mode):
+    """Same-signature calls own independent runtime descriptors during replay."""
+    inputs = [_make_wgrad_capture_inputs(), _make_wgrad_capture_inputs(a_value=-2, group_k_list=(128, 384))]
+    warmup_outputs = [torch.empty((2, 128, 128), dtype=torch.bfloat16, device="cuda") for _ in inputs]
+    outputs = [torch.full_like(output, float("nan")) for output in warmup_outputs]
+    warmup_ptrs = [_wgrad_capture_output_ptrs(output, output_mode) for output in warmup_outputs]
+    output_ptrs = [_wgrad_capture_output_ptrs(output, output_mode) for output in outputs]
+    streams = [torch.cuda.Stream() for _ in inputs]
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream())
+    # Keep cold compiler/runtime initialization out of the concurrent phase.
+    for call_inputs, output, ptrs, stream in zip(inputs, warmup_outputs, warmup_ptrs, streams):
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                _run_wgrad_capture(call_inputs, output, stream, output_mode=output_mode, output_ptrs=ptrs)
+        stream.synchronize()
+    _assert_wgrad_capture_result(warmup_outputs[0], 1, (256, 256))
+    _assert_wgrad_capture_result(warmup_outputs[1], -2, (128, 384))
+
+    graphs = [torch.cuda.CUDAGraph() for _ in inputs]
+    try:
+        for graph, call_inputs, output, ptrs, stream in zip(graphs, inputs, outputs, output_ptrs, streams):
+            with torch.cuda.graph(graph, stream=stream):
+                _run_wgrad_capture(call_inputs, output, stream, output_mode=output_mode, output_ptrs=ptrs)
+        for iteration in range(2):
+            if iteration:
+                inputs[0]["a_tensor"].copy_(inputs[0]["a_tensor"].float() * 2)
+                inputs[0]["offsets_tensor"].copy_(torch.tensor([384, 512], dtype=torch.int32, device="cuda"))
+                inputs[1]["a_tensor"].copy_(inputs[1]["a_tensor"].float() * -2)
+                inputs[1]["offsets_tensor"].copy_(torch.tensor([256, 512], dtype=torch.int32, device="cuda"))
+            for output in outputs:
+                output.fill_(float("nan"))
+            for stream in streams:
+                stream.wait_stream(torch.cuda.current_stream())
+            for _ in range(8):
+                for graph, stream in zip(graphs, streams):
+                    with torch.cuda.stream(stream):
+                        graph.replay()
+            torch.cuda.synchronize()
+            if iteration:
+                _assert_wgrad_capture_result(outputs[0], 2, (384, 128))
+                _assert_wgrad_capture_result(outputs[1], 4, (256, 256))
+            else:
+                _assert_wgrad_capture_result(outputs[0], 1, (256, 256))
+                _assert_wgrad_capture_result(outputs[1], -2, (128, 384))
+        _assert_wgrad_capture_result(warmup_outputs[0], 1, (256, 256))
+        _assert_wgrad_capture_result(warmup_outputs[1], -2, (128, 384))
+    finally:
+        for graph in graphs:
+            graph.reset()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("output_mode", ["dense", "discrete"])
+@pytest.mark.parametrize("caller_owned_workspace", [False, True], ids=["wrapper-workspace", "shared-caller-workspace"])
+def test_grouped_gemm_wgrad_wrapper_capture_sequential_shapes(output_mode, caller_owned_workspace):
+    """Sequential graph nodes may reuse descriptor storage across kernel shapes."""
+    shapes = [(128, 128), (256, 128), (128, 256)]
+    values = [1, -2, 4]
+    inputs = [_make_wgrad_capture_inputs(a_value=value, hidden=m, intermediate=n) for (m, n), value in zip(shapes, values)]
+    outputs = [torch.empty((2, m, n), dtype=torch.bfloat16, device="cuda") for m, n in shapes]
+    output_ptrs = [_wgrad_capture_output_ptrs(output, output_mode) for output in outputs]
+    workspace = None
+    if caller_owned_workspace:
+        # These calls execute sequentially on one stream. Reusing the same
+        # descriptor allocation must be safe even when the kernel shape changes.
+        workspace = torch.empty(cudnn.get_grouped_gemm_wgrad_workspace_size_sm100(2, output_mode=output_mode), dtype=torch.uint8, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    def run_all():
+        for call_inputs, output, ptrs in zip(inputs, outputs, output_ptrs):
+            _run_wgrad_capture(call_inputs, output, stream, workspace, output_mode=output_mode, output_ptrs=ptrs)
+
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            run_all()
+    stream.synchronize()
+    for output, value in zip(outputs, values):
+        _assert_wgrad_capture_result(output, value, (256, 256))
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            run_all()
+        graph.replay()
+        torch.cuda.synchronize()
+        for output, value in zip(outputs, values):
+            _assert_wgrad_capture_result(output, value, (256, 256))
+
+        for call_inputs, output in zip(inputs, outputs):
+            call_inputs["a_tensor"].copy_(call_inputs["a_tensor"].float() * 2)
+            call_inputs["offsets_tensor"].copy_(torch.tensor([128, 512], dtype=torch.int32, device="cuda"))
+            output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        for output, value in zip(outputs, values):
+            _assert_wgrad_capture_result(output, 2 * value, (128, 384))
+    finally:
+        graph.reset()
 
 
 @pytest.mark.L0

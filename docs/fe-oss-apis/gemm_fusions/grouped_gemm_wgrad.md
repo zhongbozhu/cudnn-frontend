@@ -98,10 +98,14 @@ operations for CUDA Graph replay may provide a caller-owned
 `get_grouped_gemm_wgrad_workspace_size_sm100`, keep it alive for as long as the
 captured call site may replay, and do not share it between call sites that may
 overlap. This lets multiple same-signature calls share one compiled kernel
-without sharing mutable runtime TMA descriptors. Callers that omit this
-argument retain the compatibility behavior that isolates cached API instances
-by explicit dense output address; discrete callers retain the compiled
-operation's internal workspace.
+without sharing mutable runtime TMA descriptors. When this argument is omitted,
+the wrapper allocates independent descriptor workspace for each block-scaled
+call on its launch stream. CUDA Graph capture retains this scratch in the graph's
+memory pool. The compiled operation is cached by operand metadata, so new output
+buffers reuse the warmed kernel without sharing mutable descriptor storage.
+Sequential calls may reuse workspace storage; consumers acquire runtime TMA
+descriptors before use so replay observes the latest descriptor contents even
+when a workspace address was previously used by a different kernel shape.
 
 ```python
 workspace = torch.empty(

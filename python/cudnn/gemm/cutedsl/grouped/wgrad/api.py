@@ -27,6 +27,7 @@ from cudnn.tensor_adapter import (
 from ..backend_utils import (
     GroupedGemmBackend,
     _torch_stream_context,
+    allocate_wrapper_workspace,
     backend_cache_key,
     select_grouped_gemm_backend,
     wrapper_operand_meta,
@@ -292,7 +293,8 @@ def wgrad_allocate_output(framework, wgrad_shape, wgrad_dtype, accumulate_on_out
     return jax.block_until_ready(allocator(wgrad_shape, dtype=framework_dtype(wgrad_dtype, "jax"), device=a_tensor.device))
 
 
-# Operand-metadata key -> (op, framework, output shape, output dtype); see wrapper_operand_meta.
+# Operand-metadata key -> (op, framework, output shape, output dtype, workspace bytes).
+# See wrapper_operand_meta; mutable descriptor storage is owned by each wrapper call.
 _wgrad_wrapper_memo: dict = {}
 
 
@@ -320,19 +322,6 @@ def grouped_gemm_wgrad_wrapper_sm100(
     descriptor_workspace: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """Compile and execute grouped GEMM wgrad through the selected backend API."""
-    memo_dense_output_identity = None
-    if (
-        output_mode == "dense"
-        and wgrad_tensor is not None
-        and descriptor_workspace is None
-        and sfa_tensor is not None
-        and sfb_tensor is not None
-        and hasattr(wgrad_tensor, "data_ptr")
-    ):
-        # A block-scaled API without caller-owned descriptor storage is bound to
-        # one explicit dense output. Keep memo lookup from bypassing that
-        # compatibility isolation without moving backend selection onto memo hits.
-        memo_dense_output_identity = int(wgrad_tensor.data_ptr())
     memo_key = (
         type(a_tensor),
         wrapper_operand_meta(a_tensor),
@@ -344,7 +333,6 @@ def grouped_gemm_wgrad_wrapper_sm100(
         wrapper_operand_meta(wgrad_tensor),
         wrapper_operand_meta(wgrad_ptrs),
         descriptor_workspace is not None,
-        memo_dense_output_identity,
         wrapper_operand_meta(global_scale_a),
         wrapper_operand_meta(global_scale_b),
         acc_dtype,
@@ -359,9 +347,11 @@ def grouped_gemm_wgrad_wrapper_sm100(
     )
     memo = _wgrad_wrapper_memo.get(memo_key)
     if memo is not None:
-        op, framework, wgrad_shape, memo_wgrad_dtype = memo
+        op, framework, wgrad_shape, memo_wgrad_dtype, workspace_bytes = memo
         if wgrad_tensor is None and wgrad_ptrs is None:
             wgrad_tensor = wgrad_allocate_output(framework, wgrad_shape, memo_wgrad_dtype, accumulate_on_output, a_tensor, current_stream)
+        if descriptor_workspace is None:
+            descriptor_workspace = allocate_wrapper_workspace(framework, workspace_bytes, a_tensor.device, current_stream)
         op.execute(
             a_tensor=a_tensor,
             b_tensor=b_tensor,
@@ -417,17 +407,11 @@ def grouped_gemm_wgrad_wrapper_sm100(
         raise ValueError(_BLOCK_SCALED_JAX_ERROR)
     if descriptor_workspace is not None and (backend is not GroupedGemmBackend.BLOCK_SCALED or framework != "torch"):
         raise ValueError("descriptor_workspace is supported only for torch block-scaled WGrad")
-    explicit_dense_output_identity = None
-    if (
-        backend is GroupedGemmBackend.BLOCK_SCALED
-        and framework == "torch"
-        and output_mode == "dense"
-        and wgrad_tensor is not None
-        and descriptor_workspace is None
-    ):
-        # Compatibility path: callers that do not own descriptor workspace keep
-        # the validated one-API-instance-per-output isolation.
-        explicit_dense_output_identity = int(wgrad_tensor.data_ptr())
+    workspace_bytes = (
+        get_grouped_gemm_wgrad_workspace_size_sm100(expert_cnt, output_mode=output_mode, input_order=input_order)
+        if backend is GroupedGemmBackend.BLOCK_SCALED
+        else 0
+    )
     wgrad_shape = (expert_cnt, hidden, intermediate)
     if wgrad_tensor is None and wgrad_ptrs is None:
         wgrad_tensor = wgrad_allocate_output(framework, wgrad_shape, wgrad_dtype, accumulate_on_output, a_tensor, current_stream)
@@ -453,7 +437,6 @@ def grouped_gemm_wgrad_wrapper_sm100(
         accumulate_on_output,
         input_order,
         int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
-        explicit_dense_output_identity,
     )
     op = _cache_of_GroupedGemmWgradSm100Objects.get(cache_key)
     if op is None:
@@ -500,7 +483,12 @@ def grouped_gemm_wgrad_wrapper_sm100(
             raise RuntimeError("Unsupported configuration")
         op.compile()
         _cache_of_GroupedGemmWgradSm100Objects[cache_key] = op
-    _wgrad_wrapper_memo[memo_key] = (op, framework, wgrad_shape, wgrad_dtype)
+    _wgrad_wrapper_memo[memo_key] = (op, framework, wgrad_shape, wgrad_dtype, workspace_bytes)
+    if descriptor_workspace is None:
+        # Allocate on the launch stream so eager reuse is ordered and capture
+        # retains scratch in its graph pool. Never share mutable descriptors
+        # through the cached operator or key compilation on an output address.
+        descriptor_workspace = allocate_wrapper_workspace(framework, workspace_bytes, a_tensor.device, current_stream)
     op.execute(
         a_tensor=a_tensor,
         b_tensor=b_tensor,

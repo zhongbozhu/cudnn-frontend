@@ -202,6 +202,17 @@ not become a compile key.
   `check_support()` validates and what the kernel specializes on; the key
   is that set.
 
+Output addresses are runtime bindings, not compilation keys. Isolate mutable
+descriptor workspace per wrapper call instead of caching a compiled operator
+per output pointer: CUDA Graph capture allocates fresh outputs even after a
+complete warmup. `test_grouped_gemm_wgrad_wrapper_capture_fresh_output` checks
+that transition and changed-input replay; `test_grouped_gemm_wgrad_wrapper_concurrent_graphs`
+checks that sharing the compiled operator does not share runtime descriptors.
+Graph pools may reuse scratch addresses between sequential calls. Runtime TMA
+consumers must acquire the tensormap proxy after descriptor writes; stream
+ordering alone does not invalidate it. The multi-shape detector is
+`test_grouped_gemm_wgrad_wrapper_capture_sequential_shapes`.
+
 **Rule 5 — every torch operation on the execute path is ordered on the
 LAUNCH stream, never implicitly on torch's current stream.**
 
