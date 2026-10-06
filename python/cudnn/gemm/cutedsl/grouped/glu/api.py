@@ -30,6 +30,7 @@ from ..backend_utils import (
     wrapper_operand_meta,
 )
 from ..moe_utils import MoEWeightMode
+from ..native_layout import LogicalTensor, apply_tensor_layouts, empty_logical, layout_key, native_scale_outputs, operand_meta, public_outputs, unwrap_tensor
 from cuda.bindings import driver as cuda
 import logging
 import os
@@ -199,7 +200,7 @@ class GroupedGemmGluSm100(APIBase):
         self._pending_init_kwargs = dict(locals())
         self._pending_init_kwargs.pop("self")
         self._pending_init_kwargs.pop("__class__", None)
-        framework = detect_framework(sample_a)
+        framework = detect_framework(unwrap_tensor(sample_a))
         if sample_a is not None and framework not in ("torch", "jax"):
             raise ValueError(f"Unsupported tensor framework '{framework}' for GroupedGemmGluSm100; pass torch tensors or JAX arrays")
         if acc_dtype is None:
@@ -257,7 +258,7 @@ class GroupedGemmGluSm100(APIBase):
                     use_dynamic_sched=kwargs["use_dynamic_sched"],
                 )
             else:
-                if detect_framework(kwargs["sample_a"]) == "jax":
+                if detect_framework(unwrap_tensor(kwargs["sample_a"])) == "jax":
                     raise ValueError(_JAX_BLOCK_SCALED_ERROR)
                 block_kwargs = dict(kwargs)
                 block_kwargs.pop("generate_c", None)
@@ -588,12 +589,14 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
         raise ValueError(f"cd_major must be 'n', got {cd_major}")
     is_fp8_config = a_tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and sfa_tensor.dtype in (torch.float8_e8m0fnu, torch.float8_e4m3fn)
     sf_dtype = sfa_tensor.dtype if is_fp8_config else None
-    outputs = glu_block_scaled_outputs(valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dtype, sf_vec_size, a_tensor.device)
+    outputs = glu_block_scaled_outputs(
+        valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dtype, sf_vec_size, a_tensor.device, native=isinstance(a_tensor, LogicalTensor)
+    )
     c_tensor_out, d_tensor, d_col_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor = outputs
 
     if valid_m == 0:
         _logger.debug("grouped_gemm_glu_wrapper_sm100: valid_m is zero, skipping kernel execution")
-        return outputs
+        return public_outputs(outputs) if isinstance(a_tensor, LogicalTensor) else outputs
 
     # ---- Build cache key ----
     def stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
@@ -713,6 +716,19 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
         )
 
     cache_key = backend_cache_key(GroupedGemmBackend.BLOCK_SCALED, *cache_key, int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")))
+    cache_key = (
+        *cache_key,
+        layout_key(
+            {
+                "a_tensor": a_tensor,
+                "sfa_tensor": sfa_tensor,
+                "b_tensor": b_tensor,
+                "sfb_tensor": sfb_tensor,
+                "prob_tensor": prob_tensor,
+                "bias_tensor": bias_tensor,
+            }
+        ),
+    )
 
     # ---- Cache lookup or create + compile ----
     if cache_key in _cache_of_GroupedGemmGluSm100Objects:
@@ -794,9 +810,21 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
     return glu_block_scaled_run(*memo, call, outputs)
 
 
-def glu_block_scaled_outputs(valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dtype, sf_vec_size, device) -> TupleDict:
+def glu_block_scaled_outputs(valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dtype, sf_vec_size, device, native=False) -> TupleDict:
     import torch
 
+    if native:
+        if sf_dtype != torch.float8_e8m0fnu or d_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            raise ValueError("tensor_layouts require MXFP8 E8M0 scales and explicit FP8 d_dtype")
+        sfd_row, sfd_col = native_scale_outputs(valid_m, n_out, sf_dtype, sf_vec_size, device)
+        return TupleDict(
+            c_tensor=empty_logical((valid_m, n_full, 1), (n_full, 1, valid_m * n_full), c_dtype, device, physical_shape=(valid_m, n_full)),
+            d_tensor=empty_logical((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), d_dtype, device),
+            d_col_tensor=empty_logical((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), d_dtype, device),
+            amax_tensor=None,
+            sfd_row_tensor=sfd_row,
+            sfd_col_tensor=sfd_col,
+        )
     sfd_row_tensor = sfd_col_tensor = amax_tensor = None
     if sf_dtype is not None:
         sfd_row_tensor, sfd_col_tensor = block_scaled_sfd_tensors(valid_m, n_out, sf_dtype, sf_vec_size, device)
@@ -815,7 +843,9 @@ def glu_block_scaled_outputs(valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dty
 def glu_block_scaled_run(api, valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dtype, call: GluCall, outputs: Optional[TupleDict] = None) -> TupleDict:
     """Allocate fresh outputs and execute with the current call operands."""
     if outputs is None:
-        outputs = glu_block_scaled_outputs(valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dtype, call.sf_vec_size, call.a_tensor.device)
+        outputs = glu_block_scaled_outputs(
+            valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dtype, call.sf_vec_size, call.a_tensor.device, native=isinstance(call.a_tensor, LogicalTensor)
+        )
     api.execute(
         a_tensor=call.a_tensor,
         c_tensor=outputs["c_tensor"],
@@ -842,7 +872,7 @@ def glu_block_scaled_run(api, valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dt
         situ_beta2=call.situ_beta2,
         current_stream=call.current_stream,
     )
-    return outputs
+    return public_outputs(outputs) if isinstance(call.a_tensor, LogicalTensor) else outputs
 
 
 def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
@@ -1186,8 +1216,34 @@ def grouped_gemm_glu_wrapper_sm100(
     current_stream: Optional[cuda.CUstream] = None,
     generate_c: bool = False,
     sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
+    tensor_layouts: Optional[dict] = None,
 ) -> TupleDict:
     """Dispatch grouped GEMM GLU once from an immutable normalized call."""
+    if tensor_layouts is not None:
+        if "a_tensor" not in tensor_layouts or b_tensor is None or sf_vec_size != 32:
+            raise ValueError("tensor_layouts require dense MXFP8 operands, a_tensor layout, and sf_vec_size=32")
+        native_operands = apply_tensor_layouts(
+            {
+                "a_tensor": a_tensor,
+                "sfa_tensor": sfa_tensor,
+                "b_tensor": b_tensor,
+                "sfb_tensor": sfb_tensor,
+                "prob_tensor": prob_tensor,
+                "bias_tensor": bias_tensor,
+            },
+            tensor_layouts,
+        )
+        a_tensor, sfa_tensor, b_tensor, sfb_tensor, prob_tensor, bias_tensor = (
+            native_operands["a_tensor"],
+            native_operands["sfa_tensor"],
+            native_operands["b_tensor"],
+            native_operands["sfb_tensor"],
+            native_operands["prob_tensor"],
+            native_operands["bias_tensor"],
+        )
+    native_signature = layout_key(native_operands) if tensor_layouts is not None else ()
+    get_operand_meta = operand_meta if tensor_layouts is not None else wrapper_operand_meta
+
     # Hot-loop memo; see wrapper_operand_meta for the rationale. Everything
     # from here to api.execute() is derivation -- dtype resolution, GluCall construction,
     # normalization, and the op cache-key rebuild -- and is a pure function of the
@@ -1196,18 +1252,19 @@ def grouped_gemm_glu_wrapper_sm100(
     # operand, including the data pointers the key deliberately omits. linear_offset is
     # excluded on purpose (it is not part of the op cache key either) and passed through.
     memo_key = (
+        native_signature,
         type(a_tensor),
-        wrapper_operand_meta(a_tensor),
-        wrapper_operand_meta(sfa_tensor),
-        wrapper_operand_meta(padded_offsets),
-        wrapper_operand_meta(alpha_tensor),
-        wrapper_operand_meta(b_tensor),
-        wrapper_operand_meta(sfb_tensor),
-        wrapper_operand_meta(bias_tensor),
-        wrapper_operand_meta(b_ptrs),
-        wrapper_operand_meta(sfb_ptrs),
-        wrapper_operand_meta(norm_const_tensor),
-        wrapper_operand_meta(prob_tensor),
+        get_operand_meta(a_tensor),
+        get_operand_meta(sfa_tensor),
+        get_operand_meta(padded_offsets),
+        get_operand_meta(alpha_tensor),
+        get_operand_meta(b_tensor),
+        get_operand_meta(sfb_tensor),
+        get_operand_meta(bias_tensor),
+        get_operand_meta(b_ptrs),
+        get_operand_meta(sfb_ptrs),
+        get_operand_meta(norm_const_tensor),
+        get_operand_meta(prob_tensor),
         n,
         b_dtype,
         b_major,
@@ -1313,7 +1370,7 @@ def grouped_gemm_glu_wrapper_sm100(
     if memo is not None:
         return glu_block_scaled_run(*memo, call)
 
-    framework = detect_framework(a_tensor)
+    framework = detect_framework(unwrap_tensor(a_tensor))
     if framework not in ("torch", "jax"):
         raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_glu_wrapper_sm100; pass torch tensors or JAX arrays")
     if framework == "jax":
@@ -1330,3 +1387,7 @@ def grouped_gemm_glu_wrapper_sm100(
 
 
 __all__ = ["GluCall", "GroupedGemmGluSm100", "grouped_gemm_glu_wrapper_sm100"]
+
+
+# Raw-storage layout ABI, queried once by integrations during layer initialization.
+grouped_gemm_glu_wrapper_sm100.supports_tensor_layouts = True

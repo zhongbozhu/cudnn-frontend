@@ -33,6 +33,7 @@ from ..backend_utils import (
     wrapper_workspace,
 )
 from ..moe_utils import MoEWeightMode
+from ..native_layout import LogicalTensor, apply_tensor_layouts, empty_logical, layout_key, native_scale_outputs, operand_meta, public_outputs, unwrap_tensor
 from cuda.bindings import driver as cuda
 import logging
 import os
@@ -224,7 +225,7 @@ class GroupedGemmDgluSm100(APIBase):
         self._pending_init_kwargs = dict(locals())
         self._pending_init_kwargs.pop("self")
         self._pending_init_kwargs.pop("__class__", None)
-        framework = detect_framework(sample_a)
+        framework = detect_framework(unwrap_tensor(sample_a))
         if sample_a is not None and framework not in ("torch", "jax"):
             raise ValueError(f"Unsupported tensor framework '{framework}' for GroupedGemmDgluSm100; pass torch tensors or JAX arrays")
         if acc_dtype is None:
@@ -292,7 +293,7 @@ class GroupedGemmDgluSm100(APIBase):
                     sample_activation=kwargs["sample_activation"],
                 )
             else:
-                if detect_framework(kwargs["sample_a"]) == "jax":
+                if detect_framework(unwrap_tensor(kwargs["sample_a"])) == "jax":
                     raise ValueError(_JAX_BLOCK_SCALED_ERROR)
                 block_kwargs = dict(kwargs)
                 self._value_error_if(
@@ -651,13 +652,15 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
         raise ValueError(f"cd_major must be 'n', got {cd_major}")
     is_fp8_config = a_tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and sfa_tensor.dtype in (torch.float8_e8m0fnu, torch.float8_e4m3fn)
     sf_dtype = sfa_tensor.dtype if is_fp8_config else None
-    outputs = dglu_block_scaled_outputs(valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size, generate_dbias, dprob_tensor, a_tensor.device)
+    outputs = dglu_block_scaled_outputs(
+        valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size, generate_dbias, dprob_tensor, a_tensor.device, native=isinstance(a_tensor, LogicalTensor)
+    )
     d_row_tensor, d_col_tensor, _, dbias_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor = outputs
     deterministic = call.deterministic
 
     if valid_m == 0:
         _logger.debug("grouped_gemm_dglu_wrapper_sm100: valid_m is zero, skipping kernel execution")
-        return outputs
+        return public_outputs(outputs) if isinstance(a_tensor, LogicalTensor) else outputs
 
     # ---- Build cache key ----
     def stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
@@ -774,6 +777,20 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
         )
 
     cache_key = (*cache_key, int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")))
+    cache_key = (
+        *cache_key,
+        layout_key(
+            {
+                "a_tensor": a_tensor,
+                "sfa_tensor": sfa_tensor,
+                "b_tensor": b_tensor,
+                "sfb_tensor": sfb_tensor,
+                "prob_tensor": prob_tensor,
+                "c_tensor": c_tensor,
+                "dprob_tensor": dprob_tensor,
+            }
+        ),
+    )
     if deterministic:  # the kernel writes per-N-tile slots instead of dprob; key on their count
         from ..dsrelu.api import _dprob_n_slots
 
@@ -878,9 +895,22 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
     return dglu_block_scaled_run(*memo, call, outputs)
 
 
-def dglu_block_scaled_outputs(valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size, generate_dbias, dprob_tensor, device) -> TupleDict:
+def dglu_block_scaled_outputs(valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size, generate_dbias, dprob_tensor, device, native=False) -> TupleDict:
     import torch
 
+    if native:
+        if sf_dtype != torch.float8_e8m0fnu or d_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            raise ValueError("tensor_layouts require MXFP8 E8M0 scales and explicit FP8 d_dtype")
+        sfd_row, sfd_col = native_scale_outputs(valid_m, n_out, sf_dtype, sf_vec_size, device)
+        return TupleDict(
+            d_row_tensor=empty_logical((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), d_dtype, device),
+            d_col_tensor=empty_logical((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), d_dtype, device),
+            dprob_tensor=dprob_tensor,
+            dbias_tensor=torch.zeros((l, n_out, 1), dtype=torch.bfloat16, device=device) if generate_dbias else None,
+            amax_tensor=None,
+            sfd_row_tensor=sfd_row,
+            sfd_col_tensor=sfd_col,
+        )
     sfd_row_tensor = sfd_col_tensor = amax_tensor = dbias_tensor = None
     if sf_dtype is not None:
         sfd_row_tensor, sfd_col_tensor = block_scaled_sfd_tensors(valid_m, n_out, sf_dtype, sf_vec_size, device)
@@ -902,7 +932,18 @@ def dglu_block_scaled_outputs(valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size,
 def dglu_block_scaled_run(api, valid_m, n_out, l, d_dtype, sf_dtype, generate_dbias, call: DgluCall, outputs: Optional[TupleDict] = None) -> TupleDict:
     """Allocate fresh outputs and execute with the current call operands."""
     if outputs is None:
-        outputs = dglu_block_scaled_outputs(valid_m, n_out, l, d_dtype, sf_dtype, call.sf_vec_size, generate_dbias, call.dprob_tensor, call.a_tensor.device)
+        outputs = dglu_block_scaled_outputs(
+            valid_m,
+            n_out,
+            l,
+            d_dtype,
+            sf_dtype,
+            call.sf_vec_size,
+            generate_dbias,
+            call.dprob_tensor,
+            call.a_tensor.device,
+            native=isinstance(call.a_tensor, LogicalTensor),
+        )
     dprob_slots = _dglu_dprob_slots(call, n_out // 2, valid_m) if call.deterministic else None
     api.execute(
         a_tensor=call.a_tensor,
@@ -931,7 +972,7 @@ def dglu_block_scaled_run(api, valid_m, n_out, l, d_dtype, sf_dtype, generate_db
         from ..dsrelu.api import _reduce_dprob_slots
 
         _reduce_dprob_slots(dprob_slots, call.dprob_tensor, call.current_stream)
-    return outputs
+    return public_outputs(outputs) if isinstance(call.a_tensor, LogicalTensor) else outputs
 
 
 def _dglu_dprob_slots(call: DgluCall, n_weight: int, valid_m: int):
@@ -1322,12 +1363,42 @@ def grouped_gemm_dglu_wrapper_sm100(
     round_dgrad_to_input_dtype: bool = False,
     activation_tensor: Optional[torch.Tensor] = None,
     deterministic: bool = False,
+    tensor_layouts: Optional[dict] = None,
 ) -> TupleDict:
     """Dispatch grouped GEMM dGLU once from an immutable normalized call.
 
     ``deterministic=True`` makes ``dprob`` bit-identical run to run (block-scaled kernel, torch,
     no dbias). See docs/fe-oss-apis/gemm_fusions/grouped_gemm_dglu.md.
     """
+    if tensor_layouts is not None:
+        if "a_tensor" not in tensor_layouts or b_tensor is None or sf_vec_size != 32:
+            raise ValueError("tensor_layouts require dense MXFP8 operands, a_tensor layout, and sf_vec_size=32")
+        if deterministic or activation_tensor is not None:
+            raise NotImplementedError("tensor_layouts do not yet support deterministic dprob or activation recomputation")
+        native_operands = apply_tensor_layouts(
+            {
+                "a_tensor": a_tensor,
+                "sfa_tensor": sfa_tensor,
+                "b_tensor": b_tensor,
+                "sfb_tensor": sfb_tensor,
+                "prob_tensor": prob_tensor,
+                "c_tensor": c_tensor,
+                "dprob_tensor": dprob_tensor,
+            },
+            tensor_layouts,
+        )
+        a_tensor, sfa_tensor, b_tensor, sfb_tensor, prob_tensor, c_tensor, dprob_tensor = (
+            native_operands["a_tensor"],
+            native_operands["sfa_tensor"],
+            native_operands["b_tensor"],
+            native_operands["sfb_tensor"],
+            native_operands["prob_tensor"],
+            native_operands["c_tensor"],
+            native_operands["dprob_tensor"],
+        )
+    native_signature = layout_key(native_operands) if tensor_layouts is not None else ()
+    get_operand_meta = operand_meta if tensor_layouts is not None else wrapper_operand_meta
+
     # Hot-loop memo; same shape as the unfused and GLU wrappers. Everything from here to
     # execute() is derivation -- dtype resolution, DgluCall construction, normalization and
     # the op cache-key rebuild -- and a pure function of the operands' metadata plus the
@@ -1335,22 +1406,23 @@ def grouped_gemm_dglu_wrapper_sm100(
     # check: execute() still validates every operand, including the data pointers the key
     # omits. linear_offset is in the key because the block-scaled kernel specializes on it.
     memo_key = (
+        native_signature,
         type(a_tensor),
         linear_offset,
-        wrapper_operand_meta(a_tensor),
-        wrapper_operand_meta(c_tensor),
-        wrapper_operand_meta(sfa_tensor),
-        wrapper_operand_meta(padded_offsets),
-        wrapper_operand_meta(alpha_tensor),
-        wrapper_operand_meta(beta_tensor),
-        wrapper_operand_meta(prob_tensor),
-        wrapper_operand_meta(dprob_tensor),
-        wrapper_operand_meta(b_tensor),
-        wrapper_operand_meta(sfb_tensor),
-        wrapper_operand_meta(b_ptrs),
-        wrapper_operand_meta(sfb_ptrs),
-        wrapper_operand_meta(norm_const_tensor),
-        wrapper_operand_meta(activation_tensor),
+        get_operand_meta(a_tensor),
+        get_operand_meta(c_tensor),
+        get_operand_meta(sfa_tensor),
+        get_operand_meta(padded_offsets),
+        get_operand_meta(alpha_tensor),
+        get_operand_meta(beta_tensor),
+        get_operand_meta(prob_tensor),
+        get_operand_meta(dprob_tensor),
+        get_operand_meta(b_tensor),
+        get_operand_meta(sfb_tensor),
+        get_operand_meta(b_ptrs),
+        get_operand_meta(sfb_ptrs),
+        get_operand_meta(norm_const_tensor),
+        get_operand_meta(activation_tensor),
         use_single_group_runtime_offsets,
         generate_dbias,
         n,
@@ -1464,7 +1536,7 @@ def grouped_gemm_dglu_wrapper_sm100(
     if memo is not None:
         return dglu_block_scaled_run(*memo, call)
 
-    framework = detect_framework(a_tensor)
+    framework = detect_framework(unwrap_tensor(a_tensor))
     if framework not in ("torch", "jax"):
         raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_dglu_wrapper_sm100; pass torch tensors or JAX arrays")
     if framework == "jax" and b_tensor is not None:
@@ -1477,3 +1549,7 @@ def grouped_gemm_dglu_wrapper_sm100(
     if framework == "jax":
         raise ValueError(_JAX_BLOCK_SCALED_ERROR)
     return _grouped_gemm_dglu_block_scaled_call(normalized, memo_key)
+
+
+# Raw-storage layout ABI, queried once by integrations during layer initialization.
+grouped_gemm_dglu_wrapper_sm100.supports_tensor_layouts = True

@@ -19,6 +19,8 @@ Discrete mode
 
 from __future__ import annotations
 
+from ..native_layout import LogicalTensor, native_compile, unwrap_tensor
+
 from .moe_blockscaled_grouped_gemm_dglu_dbias import BlockScaledMoEGroupedGemmDgluDbiasKernel
 from ..moe_utils import MoEWeightMode
 from ..backend_utils import rubin_single_group_offsets_kwarg
@@ -189,7 +191,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         """
         from cudnn.tensor_adapter import detect_framework
 
-        if sample_a is not None and detect_framework(sample_a) != "torch":
+        if sample_a is not None and detect_framework(unwrap_tensor(sample_a)) != "torch":
             raise ValueError(
                 "GroupedGemmDgluBlockScaledAPI supports torch tensors only: the block-scaled "
                 "scale-factor tensors use an MMA-interleaved layout that is not expressible as JAX arrays"
@@ -216,6 +218,21 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             raise ValueError("Provide either (sample_b, sample_sfb) for dense mode " "or (num_experts, b_shape, b_dtype) for discrete mode, but not both.")
 
         # ---- Common tensor descriptors ----
+        self._native_samples = {
+            "a": sample_a,
+            "b": sample_b,
+            "sfb": sample_sfb,
+            "c": sample_c,
+            "d": sample_d_row,
+            "d_col": sample_d_col,
+            "sfa": sample_sfa,
+            "sfd_row_tensor": sample_sfd_row,
+            "sfd_col_tensor": sample_sfd_col,
+            "prob": sample_prob,
+            "dprob": sample_dprob,
+        }
+        self._native_samples = {name: tensor for name, tensor in self._native_samples.items() if isinstance(tensor, LogicalTensor)}
+
         self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
         self.c_desc = self._make_tensor_desc(sample_c, name="sample_c")
         self.d_row_desc = self._make_tensor_desc(sample_d_row, name="sample_d_row")
@@ -1023,7 +1040,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                     "situ_beta2": self.situ_beta2,
                 }
             )
-        _compiled_kernel = cute.compile(gemm_dglu, **compile_kwargs)
+        _compiled_kernel = native_compile(gemm_dglu, compile_kwargs, self._native_samples)
+        self._native_samples = {}
 
         def tensor_api(
             a_tensor: torch.Tensor,
@@ -1363,23 +1381,23 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         validate_workspace_aliases(
             ws_view.data_ptr(),
             nbytes,
-            a_tensor=a_tensor,
-            c_tensor=c_tensor,
-            d_row_tensor=d_row_tensor,
-            d_col_tensor=d_col_tensor,
-            sfa_tensor=sfa_tensor,
+            a_tensor=unwrap_tensor(a_tensor),
+            c_tensor=unwrap_tensor(c_tensor),
+            d_row_tensor=unwrap_tensor(d_row_tensor),
+            d_col_tensor=unwrap_tensor(d_col_tensor),
+            sfa_tensor=unwrap_tensor(sfa_tensor),
             padded_offsets=padded_offsets,
             alpha_tensor=alpha_tensor,
             beta_tensor=beta_tensor,
-            prob_tensor=prob_tensor,
-            dprob_tensor=dprob_tensor,
-            b_tensor=b_tensor,
-            sfb_tensor=sfb_tensor,
+            prob_tensor=unwrap_tensor(prob_tensor),
+            dprob_tensor=unwrap_tensor(dprob_tensor),
+            b_tensor=unwrap_tensor(b_tensor),
+            sfb_tensor=unwrap_tensor(sfb_tensor),
             b_ptrs=b_ptrs,
             sfb_ptrs=sfb_ptrs,
             dbias_tensor=dbias_tensor,
-            sfd_row_tensor=sfd_row_tensor,
-            sfd_col_tensor=sfd_col_tensor,
+            sfd_row_tensor=unwrap_tensor(sfd_row_tensor),
+            sfd_col_tensor=unwrap_tensor(sfd_col_tensor),
             amax_tensor=amax_tensor,
             norm_const_tensor=norm_const_tensor,
         )

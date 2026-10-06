@@ -14,6 +14,33 @@ This kernel uses the unified `BlockScaledMoEGroupedGemmQuantKernel` which suppor
 
 Groups are contiguous in the M dimension and described by `padded_offsets` (cumulative aligned end offsets).
 
+### Raw MXFP8 storage
+
+The optional `tensor_layouts` argument accepts a mapping from operand names to
+`(logical_shape, logical_strides, logical_dtype)`. Strides are measured in
+logical elements. Supported wrapper entries are `a_tensor`, `b_tensor`,
+`sfa_tensor`, `sfb_tensor`, `bias_tensor`, `prob_tensor`, and a caller-provided
+`d_tensor`. The class API also
+accepts layouts for its preallocated `d_col_tensor`, `sfd_row_tensor`, and
+`sfd_col_tensor` operands.
+
+Pass contiguous CUDA storage with enough bytes for the declared layout.
+MXFP8 payloads and E8M0 scale factors may use `torch.uint8` storage with the
+corresponding FP8 logical dtype. Floating-point output buffers retain their
+storage dtype. FP4 reinterpretation is not supported by this argument.
+The compiled CuTe launcher constructs the declared tensor layout; execution
+does not create Torch views, transpose buffers, or launch a conversion kernel.
+Offsets and pointer arrays keep their existing contracts.
+
+With `tensor_layouts`, wrapper-allocated FP8 data and scales are returned as
+flat physical `torch.uint8` buffers. Wrapper-allocated BF16/FP16 data is
+returned as `(valid_m, N)` storage. A supplied `d_tensor` is returned unchanged.
+Without `tensor_layouts`, the existing logical output views are preserved.
+The wrapper advertises this capability with `supports_tensor_layouts = True`.
+Compile and warm up before CUDA graph capture, and keep all storage alive
+until its launch stream completes. For class API calls with changing logical
+dimensions, provide the current `tensor_layouts` to `execute()`.
+
 This kernel performs:
 1. **Block-scaled grouped GEMM**: Low-precision GEMM (FP4, FP8) with per-block scale factors across multiple expert groups
 2. **Per-row gating**: Multiplies output by per-row gating probability

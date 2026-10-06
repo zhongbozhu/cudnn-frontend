@@ -35,7 +35,8 @@ from .grouped_gemm_quant import (
     BlockScaledMoEGroupedGemmQuantKernel,
 )
 from ..moe_utils import MoEWeightMode
-from ..backend_utils import rubin_single_group_offsets_kwarg
+from ..backend_utils import rubin_single_group_offsets_kwarg, wrapper_operand_meta
+from ..native_layout import LogicalTensor, apply_tensor_layouts, empty_logical, layout_key, logical_tensor, native_compile, unwrap_tensor
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
 
@@ -103,6 +104,7 @@ class GroupedGemmQuantSm100(APIBase):
         b_major: str = "k",
         use_dynamic_sched: bool = False,
         use_single_group_runtime_offsets: bool = False,
+        tensor_layouts: Optional[dict] = None,
     ):
         """Initialize the GroupedGemmQuantSm100 API.
 
@@ -143,7 +145,50 @@ class GroupedGemmQuantSm100(APIBase):
         :param b_major: Major dimension for B tensor, one of "k" or "n"
         :param use_dynamic_sched: Enable dynamic tile scheduling for load balancing
         """
-        framework = detect_framework(sample_a)
+        self._tensor_layouts = tensor_layouts or {}
+        supported_layouts = {
+            "a_tensor": sample_a,
+            "b_tensor": sample_b,
+            "sfa_tensor": sample_sfa,
+            "sfb_tensor": sample_sfb,
+            "d_tensor": sample_d,
+            "d_col_tensor": sample_d_col,
+            "sfd_row_tensor": sample_sfd_row,
+            "sfd_col_tensor": sample_sfd_col,
+            "bias_tensor": sample_bias,
+            "prob_tensor": sample_prob,
+        }
+        for name in self._tensor_layouts:
+            if name not in supported_layouts or supported_layouts[name] is None:
+                raise ValueError(f"tensor_layouts entry {name} has no supported tensor")
+        sample_a = logical_tensor(sample_a, self._tensor_layouts.get("a_tensor"))
+        sample_b = logical_tensor(sample_b, self._tensor_layouts.get("b_tensor"))
+        sample_sfa = logical_tensor(sample_sfa, self._tensor_layouts.get("sfa_tensor"))
+        sample_sfb = logical_tensor(sample_sfb, self._tensor_layouts.get("sfb_tensor"))
+        sample_d = logical_tensor(sample_d, self._tensor_layouts.get("d_tensor"))
+        sample_d_col = logical_tensor(sample_d_col, self._tensor_layouts.get("d_col_tensor"))
+        sample_sfd_row = logical_tensor(sample_sfd_row, self._tensor_layouts.get("sfd_row_tensor"))
+        sample_sfd_col = logical_tensor(sample_sfd_col, self._tensor_layouts.get("sfd_col_tensor"))
+        sample_bias = logical_tensor(sample_bias, self._tensor_layouts.get("bias_tensor"))
+        sample_prob = logical_tensor(sample_prob, self._tensor_layouts.get("prob_tensor"))
+        self._native_layout_tensors = {
+            name: tensor
+            for name, tensor in {
+                "a": sample_a,
+                "b": sample_b,
+                "sfa": sample_sfa,
+                "sfb": sample_sfb,
+                "c": sample_d,
+                "d": sample_d,
+                "d_col": sample_d if sample_d_col is None else sample_d_col,
+                "sfd_row_tensor": sample_sfd_row,
+                "sfd_col_tensor": sample_sfd_col,
+                "bias": sample_bias,
+                "prob": sample_prob,
+            }.items()
+            if isinstance(tensor, LogicalTensor)
+        }
+        framework = detect_framework(unwrap_tensor(sample_a))
         if framework == "jax":
             raise ValueError(f"GroupedGemmQuantSm100 does not support JAX arrays: {_JAX_SF_LAYOUT_ERROR}")
         if framework != "torch":
@@ -647,6 +692,7 @@ class GroupedGemmQuantSm100(APIBase):
         else:
             self._compile_discrete(gemm_quant, max_active_clusters, fake_stream)
 
+        self._native_layout_tensors.clear()
         self._logger.debug("Kernel compiled successfully")
 
     def _compile_dense(self, gemm_quant, max_active_clusters, fake_stream) -> None:
@@ -862,9 +908,11 @@ class GroupedGemmQuantSm100(APIBase):
             compile_kwargs["epilogue_op"] = lambda x: x
         else:
             compile_kwargs["row_scale"] = row_scale_cute_fake
-        _compiled_kernel = cute.compile(gemm_quant, **compile_kwargs)
+        _compiled_kernel = native_compile(gemm_quant, compile_kwargs, self._native_layout_tensors)
 
         cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
+        cached_zero_int32 = cutlass.Int32(0)
+        cached_zero_int64 = cutlass.Int64(0)
 
         def tensor_api(
             a_tensor: torch.Tensor,
@@ -890,9 +938,9 @@ class GroupedGemmQuantSm100(APIBase):
                     a_tensor,
                     b_tensor,
                     sfb_tensor,
-                    cutlass.Int32(0),
-                    cutlass.Int32(0),
-                    cutlass.Int64(0),
+                    cached_zero_int32,
+                    cached_zero_int32,
+                    cached_zero_int64,
                     cached_workspace_ptr,
                     d_tensor,
                     d_tensor,
@@ -913,9 +961,9 @@ class GroupedGemmQuantSm100(APIBase):
                     a_tensor,
                     b_tensor,
                     sfb_tensor,
-                    cutlass.Int32(0),
-                    cutlass.Int32(0),
-                    cutlass.Int64(0),
+                    cached_zero_int32,
+                    cached_zero_int32,
+                    cached_zero_int64,
                     cached_workspace_ptr,
                     d_tensor,
                     d_col_tensor,
@@ -1062,7 +1110,7 @@ class GroupedGemmQuantSm100(APIBase):
             compile_kwargs["c"] = d_tensor
         else:
             compile_kwargs["row_scale"] = row_scale_tensor
-        _compiled_kernel = cute.compile(gemm_quant, **compile_kwargs)
+        _compiled_kernel = native_compile(gemm_quant, compile_kwargs, self._native_layout_tensors)
 
         cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
         cached_n = cutlass.Int32(n)
@@ -1161,6 +1209,7 @@ class GroupedGemmQuantSm100(APIBase):
         prob_tensor: Optional[torch.Tensor] = None,
         row_scale_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        tensor_layouts: Optional[dict] = None,
     ) -> None:
         """Execute the compiled kernel.
 
@@ -1190,10 +1239,37 @@ class GroupedGemmQuantSm100(APIBase):
         :param current_stream: CUDA stream
         """
         self._logger.debug("Entering execute")
+        layouts = self._tensor_layouts if tensor_layouts is None else tensor_layouts
+        if layouts:
+            supported_layouts = {
+                "a_tensor": a_tensor,
+                "b_tensor": b_tensor,
+                "sfa_tensor": sfa_tensor,
+                "sfb_tensor": sfb_tensor,
+                "d_tensor": d_tensor,
+                "d_col_tensor": d_col_tensor,
+                "sfd_row_tensor": sfd_row_tensor,
+                "sfd_col_tensor": sfd_col_tensor,
+                "bias_tensor": bias_tensor,
+                "prob_tensor": prob_tensor,
+            }
+            for name in layouts:
+                if name not in supported_layouts or supported_layouts[name] is None:
+                    raise ValueError(f"tensor_layouts entry {name} has no supported tensor")
+            a_tensor = logical_tensor(a_tensor, layouts.get("a_tensor"))
+            b_tensor = logical_tensor(b_tensor, layouts.get("b_tensor"))
+            sfa_tensor = logical_tensor(sfa_tensor, layouts.get("sfa_tensor"))
+            sfb_tensor = logical_tensor(sfb_tensor, layouts.get("sfb_tensor"))
+            d_tensor = logical_tensor(d_tensor, layouts.get("d_tensor"))
+            d_col_tensor = logical_tensor(d_col_tensor, layouts.get("d_col_tensor"))
+            sfd_row_tensor = logical_tensor(sfd_row_tensor, layouts.get("sfd_row_tensor"))
+            sfd_col_tensor = logical_tensor(sfd_col_tensor, layouts.get("sfd_col_tensor"))
+            bias_tensor = logical_tensor(bias_tensor, layouts.get("bias_tensor"))
+            prob_tensor = logical_tensor(prob_tensor, layouts.get("prob_tensor"))
         if current_stream is None:
             # torch inputs stay ordered with the caller's current torch stream;
             # other frameworks default to the CUDA legacy default stream.
-            current_stream = default_stream(detect_framework(a_tensor))
+            current_stream = default_stream(detect_framework(unwrap_tensor(a_tensor)))
 
         if a_tensor.shape[0] == 0:
             self._logger.debug("execute: valid_m is zero, skipping kernel execution")
@@ -1282,6 +1358,15 @@ import logging
 
 _logger = logging.getLogger(__name__)
 _cache_of_GroupedGemmQuantSm100Objects = {}
+# Exact native metadata -> existing dynamic compile key and immutable output shape.
+# Never retain input/output tensors or pointers, and honor clears of the compile cache.
+_native_quant_wrapper_memo = {}
+
+
+def _quant_operand_meta(tensor):
+    if isinstance(tensor, LogicalTensor):
+        return tensor._operand_meta, tensor._raw_abi
+    return wrapper_operand_meta(tensor)
 
 
 def grouped_gemm_quant_wrapper_sm100(
@@ -1314,6 +1399,7 @@ def grouped_gemm_quant_wrapper_sm100(
     use_dynamic_sched: bool = False,
     use_single_group_runtime_offsets: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
+    tensor_layouts: Optional[dict] = None,
 ) -> TupleDict:
     """Convenience wrapper for grouped GEMM Quant operation.
 
@@ -1388,14 +1474,104 @@ def grouped_gemm_quant_wrapper_sm100(
                 d = result[0]  # d_tensor
     """
     from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
+    import torch
 
-    framework = detect_framework(a_tensor)
+    layouts = tensor_layouts or {}
+    native_memo_key = None
+    if layouts:
+        operands = apply_tensor_layouts(
+            dict(
+                a_tensor=a_tensor,
+                b_tensor=b_tensor,
+                sfa_tensor=sfa_tensor,
+                sfb_tensor=sfb_tensor,
+                d_tensor=d_tensor,
+                bias_tensor=bias_tensor,
+                prob_tensor=prob_tensor,
+            ),
+            layouts,
+        )
+        a_tensor = operands["a_tensor"]
+        b_tensor = operands["b_tensor"]
+        sfa_tensor = operands["sfa_tensor"]
+        sfb_tensor = operands["sfb_tensor"]
+        d_tensor = operands["d_tensor"]
+        bias_tensor = operands["bias_tensor"]
+        prob_tensor = operands["prob_tensor"]
+        # TE's FC2/DGRAD calls provide the BF16 output. On repeated metadata,
+        # reuse validated planning and allocate only the existing amax result.
+        if d_tensor is not None and d_tensor.dtype in (torch.bfloat16, torch.float16):
+            native_memo_key = (
+                tuple(
+                    _quant_operand_meta(tensor)
+                    for tensor in (
+                        a_tensor,
+                        b_tensor,
+                        sfa_tensor,
+                        sfb_tensor,
+                        d_tensor,
+                        bias_tensor,
+                        prob_tensor,
+                        row_scale_tensor,
+                        alpha_tensor,
+                        padded_offsets,
+                        b_ptrs,
+                        sfb_ptrs,
+                        norm_const_tensor,
+                    )
+                ),
+                n,
+                b_dtype,
+                b_major,
+                acc_dtype,
+                d_dtype,
+                cd_major,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                sf_vec_size,
+                sf_fp8_dtype_override,
+                vector_f32,
+                m_aligned,
+                discrete_col_sfd,
+                use_dynamic_sched,
+                use_single_group_runtime_offsets,
+                os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1"),
+                os.environ.get("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+            )
+            memo = _native_quant_wrapper_memo.get(native_memo_key)
+            if memo is not None:
+                compiled_key, amax_shape = memo
+                grouped_gemm_quant = _cache_of_GroupedGemmQuantSm100Objects.get(compiled_key)
+                if grouped_gemm_quant is not None:
+                    amax_tensor = torch.full(amax_shape, float("-inf"), dtype=torch.float32, device=a_tensor.device)
+                    grouped_gemm_quant.execute(
+                        a_tensor=a_tensor,
+                        sfa_tensor=sfa_tensor,
+                        padded_offsets=padded_offsets,
+                        alpha_tensor=alpha_tensor,
+                        d_tensor=d_tensor,
+                        b_tensor=b_tensor,
+                        sfb_tensor=sfb_tensor,
+                        b_ptrs=b_ptrs,
+                        sfb_ptrs=sfb_ptrs,
+                        amax_tensor=amax_tensor,
+                        prob_tensor=prob_tensor,
+                        row_scale_tensor=row_scale_tensor,
+                        bias_tensor=bias_tensor,
+                        current_stream=current_stream,
+                    )
+                    return TupleDict(
+                        d_tensor=unwrap_tensor(d_tensor),
+                        d_col_tensor=None,
+                        amax_tensor=amax_tensor,
+                        sfd_row_tensor=None,
+                        sfd_col_tensor=None,
+                    )
+    framework = detect_framework(unwrap_tensor(a_tensor))
     if framework == "jax":
         raise ValueError(f"grouped_gemm_quant_wrapper_sm100 does not support JAX arrays: {_JAX_SF_LAYOUT_ERROR}")
     if framework != "torch":
         raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_quant_wrapper_sm100; pass torch tensors")
-    import torch
-
     acc_dtype = _convert_to_cutlass_data_type(acc_dtype) if acc_dtype is not None else cutlass.Float32
     d_dtype = _convert_to_cutlass_data_type(d_dtype) if d_dtype is not None else cutlass.BFloat16
     b_dtype = _convert_to_cutlass_data_type(b_dtype) if b_dtype is not None else None
@@ -1446,7 +1622,17 @@ def grouped_gemm_quant_wrapper_sm100(
         expected_shape = (valid_m, n_out, 1)
         expected_stride = (n_out, 1, valid_m * n_out)
         if d_tensor is None:
-            d_tensor = torch.empty_strided(expected_shape, expected_stride, dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
+            if layouts:
+                storage_shape = (valid_m * n_out,) if is_low_precision_output_config else (valid_m, n_out)
+                d_tensor = empty_logical(
+                    expected_shape,
+                    expected_stride,
+                    framework_dtype(d_dtype, "torch"),
+                    a_tensor.device,
+                    physical_shape=storage_shape,
+                )
+            else:
+                d_tensor = torch.empty_strided(expected_shape, expected_stride, dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
         elif (
             tuple(d_tensor.shape) != expected_shape
             or tuple(d_tensor.stride()) != expected_stride
@@ -1458,11 +1644,19 @@ def grouped_gemm_quant_wrapper_sm100(
                 f"dtype {d_dtype}, device {a_tensor.device}, but got shape {tuple(d_tensor.shape)}, "
                 f"stride {tuple(d_tensor.stride())}, dtype {d_tensor.dtype}, device {d_tensor.device}."
             )
-        d_col_tensor = (
-            torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
-            if is_low_precision_output_config
-            else None
-        )
+        if layouts and is_low_precision_output_config:
+            d_col_tensor = empty_logical(
+                expected_shape,
+                expected_stride,
+                framework_dtype(d_dtype, "torch"),
+                a_tensor.device,
+            )
+        else:
+            d_col_tensor = (
+                torch.empty_strided(expected_shape, expected_stride, dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
+                if is_low_precision_output_config
+                else None
+            )
     else:
         raise ValueError(f"cd_major must be 'n', got {cd_major}")
 
@@ -1495,7 +1689,13 @@ def grouped_gemm_quant_wrapper_sm100(
             4,
             4,
         )
-        sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
+        if layouts:
+            blocks_m, blocks_n = mma_shape_row[1:3]
+            sf_shape = (32, 4, blocks_m, 4, blocks_n, 1)
+            sf_stride = (16, 4, blocks_n * 512, 1, 512, blocks_m * blocks_n * 512)
+            sfd_row_tensor = empty_logical(sf_shape, sf_stride, sf_dtype, a_tensor.device)
+        else:
+            sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
 
         sf_k_col = ceil_div(valid_m, sf_vec_size)
         mma_shape_col = (
@@ -1506,7 +1706,13 @@ def grouped_gemm_quant_wrapper_sm100(
             4,
             4,
         )
-        sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
+        if layouts:
+            blocks_m, blocks_n = mma_shape_col[1:3]
+            sf_shape = (32, 4, blocks_m, 4, blocks_n, 1)
+            sf_stride = (16, 4, blocks_n * 512, 1, 512, blocks_m * blocks_n * 512)
+            sfd_col_tensor = empty_logical(sf_shape, sf_stride, sf_dtype, a_tensor.device)
+        else:
+            sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
 
     if d_dtype in (cutlass.BFloat16, cutlass.Float16):
         _logger.debug("grouped_gemm_quant_wrapper_sm100: Detected bf16/float16 d_dtype, constructing amax_tensor")
@@ -1526,11 +1732,11 @@ def grouped_gemm_quant_wrapper_sm100(
     if valid_m == 0:
         _logger.debug("grouped_gemm_quant_wrapper_sm100: valid_m is zero, skipping kernel execution")
         return TupleDict(
-            d_tensor=d_tensor,
-            d_col_tensor=d_col_tensor,
+            d_tensor=unwrap_tensor(d_tensor),
+            d_col_tensor=unwrap_tensor(d_col_tensor),
             amax_tensor=amax_tensor,
-            sfd_row_tensor=sfd_row_tensor,
-            sfd_col_tensor=sfd_col_tensor,
+            sfd_row_tensor=unwrap_tensor(sfd_row_tensor),
+            sfd_col_tensor=unwrap_tensor(sfd_col_tensor),
         )
 
     def tensor_signature(tensor: Optional[torch.Tensor]) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[torch.dtype]]:
@@ -1638,6 +1844,22 @@ def grouped_gemm_quant_wrapper_sm100(
             num_experts,
         )
 
+    cache_key += (
+        layout_key(
+            dict(
+                a_tensor=a_tensor,
+                b_tensor=b_tensor,
+                sfa_tensor=sfa_tensor,
+                sfb_tensor=sfb_tensor,
+                d_tensor=d_tensor,
+                d_col_tensor=d_col_tensor,
+                sfd_row_tensor=sfd_row_tensor,
+                sfd_col_tensor=sfd_col_tensor,
+                bias_tensor=bias_tensor,
+                prob_tensor=prob_tensor,
+            )
+        ),
+    )
     if cache_key in _cache_of_GroupedGemmQuantSm100Objects:
         _logger.debug("grouped_gemm_quant_wrapper_sm100: Using previously cached GroupedGemmQuantSm100 object")
         grouped_gemm_quant = _cache_of_GroupedGemmQuantSm100Objects[cache_key]
@@ -1706,6 +1928,11 @@ def grouped_gemm_quant_wrapper_sm100(
         grouped_gemm_quant.compile()
         _cache_of_GroupedGemmQuantSm100Objects[cache_key] = grouped_gemm_quant
 
+    if native_memo_key is not None:
+        if len(_native_quant_wrapper_memo) >= 256:
+            _native_quant_wrapper_memo.clear()
+        _native_quant_wrapper_memo[native_memo_key] = (cache_key, (l, 1))
+
     if is_dense:
         grouped_gemm_quant.execute(
             a_tensor=a_tensor,
@@ -1746,9 +1973,12 @@ def grouped_gemm_quant_wrapper_sm100(
         )
 
     return TupleDict(
-        d_tensor=d_tensor,
-        d_col_tensor=d_col_tensor,
+        d_tensor=unwrap_tensor(d_tensor),
+        d_col_tensor=unwrap_tensor(d_col_tensor),
         amax_tensor=amax_tensor,
-        sfd_row_tensor=sfd_row_tensor,
-        sfd_col_tensor=sfd_col_tensor,
+        sfd_row_tensor=unwrap_tensor(sfd_row_tensor),
+        sfd_col_tensor=unwrap_tensor(sfd_col_tensor),
     )
+
+
+grouped_gemm_quant_wrapper_sm100.supports_tensor_layouts = True

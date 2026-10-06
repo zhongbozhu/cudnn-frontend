@@ -19,6 +19,7 @@ from cudnn.tensor_adapter import is_torch_tensor
 
 from .moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
 from ..moe_utils import MoEWeightMode, WGradInputOrder
+from ..native_layout import LogicalTensor, logical_tensor, native_compile, unwrap_tensor
 
 
 def _get_rubin_kernel():
@@ -66,8 +67,36 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         accumulate_on_output: bool = False,
         input_order: Union[WGradInputOrder, str] = WGradInputOrder.Tensor2D,
+        tensor_layouts: Optional[dict] = None,
     ):
-        if sample_a is not None and not is_torch_tensor(sample_a):
+        self._tensor_layouts = tensor_layouts or {}
+        supported_layouts = {
+            "a_tensor": sample_a,
+            "b_tensor": sample_b,
+            "sfa_tensor": sample_sfa,
+            "sfb_tensor": sample_sfb,
+            "wgrad_tensor": sample_wgrad,
+        }
+        for name in self._tensor_layouts:
+            if name not in supported_layouts or supported_layouts[name] is None:
+                raise ValueError(f"tensor_layouts entry {name} has no supported tensor")
+        sample_a = logical_tensor(sample_a, self._tensor_layouts.get("a_tensor"))
+        sample_b = logical_tensor(sample_b, self._tensor_layouts.get("b_tensor"))
+        sample_sfa = logical_tensor(sample_sfa, self._tensor_layouts.get("sfa_tensor"))
+        sample_sfb = logical_tensor(sample_sfb, self._tensor_layouts.get("sfb_tensor"))
+        sample_wgrad = logical_tensor(sample_wgrad, self._tensor_layouts.get("wgrad_tensor"))
+        self._native_layout_tensors = {
+            name: tensor
+            for name, tensor in {
+                "mat_a": sample_a,
+                "mat_b": sample_b,
+                "scale_a": sample_sfa,
+                "scale_b": sample_sfb,
+                "out": sample_wgrad,
+            }.items()
+            if isinstance(tensor, LogicalTensor)
+        }
+        if sample_a is not None and not is_torch_tensor(unwrap_tensor(sample_a)):
             raise ValueError(
                 "The block-scaled wgrad backend supports torch tensors only: its B operand "
                 "(and fp4-packed A/B operands) require K-major (token-innermost) layouts that "
@@ -346,6 +375,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         else:
             self._compile_discrete(kernel, max_active_clusters, fake_stream)
 
+        self._native_layout_tensors.clear()
         if self.sample_a_tensor is not None:
             del self.sample_a_tensor
         if self.sample_b_tensor is not None:
@@ -406,21 +436,24 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         gs_a_fake = self._make_fake_cute_tensor_from_desc(self.global_scale_a_desc, assumed_align=4)
         gs_b_fake = self._make_fake_cute_tensor_from_desc(self.global_scale_b_desc, assumed_align=4)
 
-        compiled = cute.compile(
+        compiled = native_compile(
             kernel,
-            a_fake,
-            b_fake,
-            sfa_fake,
-            sfb_fake,
-            wgrad_fake,
-            offsets_fake,
-            workspace_fake,
-            max_active_clusters,
-            fake_stream,
-            gs_a_fake,
-            gs_b_fake,
-            None,
-            options="--enable-tvm-ffi",
+            dict(
+                mat_a=a_fake,
+                mat_b=b_fake,
+                scale_a=sfa_fake,
+                scale_b=sfb_fake,
+                out=wgrad_fake,
+                offs=offsets_fake,
+                workspace=workspace_fake,
+                max_active_clusters=max_active_clusters,
+                stream=fake_stream,
+                global_scale_a=gs_a_fake,
+                global_scale_b=gs_b_fake,
+                out_single_expert=None,
+                options="--enable-tvm-ffi",
+            ),
+            self._native_layout_tensors,
         )
         self._workspace_arg = from_dlpack(
             self._workspace,
@@ -520,21 +553,24 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             assumed_align=16,
         )
 
-        compiled = cute.compile(
+        compiled = native_compile(
             kernel,
-            a_fake,
-            b_fake,
-            sfa_fake,
-            sfb_fake,
-            wgrad_ptrs_fake,
-            offsets_fake,
-            workspace_fake,
-            max_active_clusters,
-            fake_stream,
-            gs_a_fake,
-            gs_b_fake,
-            single_expert_fake,
-            options="--enable-tvm-ffi",
+            dict(
+                mat_a=a_fake,
+                mat_b=b_fake,
+                scale_a=sfa_fake,
+                scale_b=sfb_fake,
+                out=wgrad_ptrs_fake,
+                offs=offsets_fake,
+                workspace=workspace_fake,
+                max_active_clusters=max_active_clusters,
+                stream=fake_stream,
+                global_scale_a=gs_a_fake,
+                global_scale_b=gs_b_fake,
+                out_single_expert=single_expert_fake,
+                options="--enable-tvm-ffi",
+            ),
+            self._native_layout_tensors,
         )
 
         self._workspace_arg = from_dlpack(
@@ -595,9 +631,27 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         global_scale_a: Optional[torch.Tensor] = None,
         global_scale_b: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        tensor_layouts: Optional[dict] = None,
     ) -> None:
         import torch
 
+        layouts = self._tensor_layouts if tensor_layouts is None else tensor_layouts
+        if layouts:
+            supported_layouts = {
+                "a_tensor": a_tensor,
+                "b_tensor": b_tensor,
+                "sfa_tensor": sfa_tensor,
+                "sfb_tensor": sfb_tensor,
+                "wgrad_tensor": wgrad_tensor,
+            }
+            for name in layouts:
+                if name not in supported_layouts or supported_layouts[name] is None:
+                    raise ValueError(f"tensor_layouts entry {name} has no supported tensor")
+            a_tensor = logical_tensor(a_tensor, layouts.get("a_tensor"))
+            b_tensor = logical_tensor(b_tensor, layouts.get("b_tensor"))
+            sfa_tensor = logical_tensor(sfa_tensor, layouts.get("sfa_tensor"))
+            sfb_tensor = logical_tensor(sfb_tensor, layouts.get("sfb_tensor"))
+            wgrad_tensor = logical_tensor(wgrad_tensor, layouts.get("wgrad_tensor"))
         current_stream = self._get_default_stream(current_stream)
         self._runtime_error_if(self._compiled_kernel is None, "Kernel not compiled; call compile() first")
 

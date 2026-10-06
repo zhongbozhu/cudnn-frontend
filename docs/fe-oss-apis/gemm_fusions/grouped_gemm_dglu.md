@@ -754,6 +754,37 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 
 ## Usage Examples
 
+### Explicit layouts over raw MXFP8 storage
+
+The Torch wrapper accepts `tensor_layouts`, using the same
+`argument_name: (logical_shape, logical_strides_in_elements, logical_dtype)`
+contract as [GLU](grouped_gemm_glu.md#explicit-layouts-over-raw-mxfp8-storage).
+The supported input names are `a_tensor`, `b_tensor`, `c_tensor`, `sfa_tensor`,
+`sfb_tensor`, `prob_tensor`, and `dprob_tensor`. Dense MXFP8 inputs,
+E8M0 scales, explicit FP8 `d_dtype`, `sf_vec_size=32`, and an `a_tensor` entry
+are required. Existing K-major and
+N-major FP8 weight interpretations remain available through their exact
+logical strides. A one-dimensional FP32 dprob allocation can be declared as
+the existing logical `(m, 1, 1)` output and is returned unchanged; the caller
+must still zero it before execution.
+
+Quantized D_row, D_col, SFD_row, and SFD_col are returned as flat physical
+`uint8` storage. Column quantization does not transpose D_col's data layout.
+The kernel still requires the same packed scale bytes, padding, allocation
+capacity, stream ordering, and operand lifetime. The compiled launcher
+reinterprets raw base pointers using runtime shape/stride metadata; no Torch
+view, dtype conversion, or repacking kernel is introduced. Legacy calls
+without the mapping retain their original behavior.
+
+Bias gradients retain the legacy BF16 `(experts, n_out, 1)` allocation and
+atomic reduction behavior, including its existing order dependence for
+multiple M tiles. This initial raw-storage path excludes deterministic dprob
+and activation recomputation. The class API and JAX contract are unchanged.
+`grouped_gemm_dglu_wrapper_sm100.supports_tensor_layouts` permits a capability
+check at layer initialization. Tests in
+`test/python/gemm/cutedsl/test_grouped_gemm_glu_native_layout.py` compare the
+native and legacy paths, changed token capacities, and CUDA graph replay.
+
 For usage examples, see test cases in `test/python/gemm/cutedsl/test_grouped_gemm_dglu.py` (dense mode, unified API) and `test/python/gemm/cutedsl/test_discrete_grouped_gemm_dswiglu.py` (discrete mode).
 Rubin MXFP8 activation-parameter coverage is in
 `test/python/gemm/cutedsl/test_grouped_gemm_dglu.py`

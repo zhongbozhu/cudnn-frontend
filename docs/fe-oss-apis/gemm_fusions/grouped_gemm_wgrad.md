@@ -11,6 +11,29 @@ The CuTe DSL dependencies both APIs need ship with the package:
 pip install nvidia-cudnn-frontend
 ```
 
+## Raw MXFP8 storage
+
+For block-scaled MXFP8 inputs, the optional `tensor_layouts` argument maps
+`a_tensor`, `b_tensor`, `sfa_tensor`, `sfb_tensor`, and optionally a dense
+`wgrad_tensor` to `(logical_shape, logical_strides, logical_dtype)` triples.
+Strides are in logical elements. For example, the logical A/B shapes remain
+`(hidden, tokens_sum)` and `(tokens_sum, intermediate)` even when their storage
+is a flat `torch.uint8` buffer. Scale layouts remain the two-dimensional
+assembled scale layouts expected by this API.
+
+Storage must be contiguous CUDA memory and cover the complete declared span.
+The byte interpretation supports FP8 data and E8M0 scales; FP4 and the BF16
+input backend retain their existing APIs. The CuTe launcher reconstructs the
+logical layout without creating Torch views or converting device data.
+Dense output storage is returned unchanged. Discrete output pointer arrays
+keep their existing ownership and lifetime contract.
+
+The wrapper advertises this capability with `supports_tensor_layouts = True`.
+Compile and warm up before graph capture. Shapes may change between calls
+under the existing dynamic-token contract; pass the current `tensor_layouts`
+to a direct class API `execute()` when they do. Existing calls without this
+argument retain their current behavior.
+
 ## JAX support
 
 Supports **JAX arrays** on the BF16 backend: A k-major and B n-major C-contiguous arrays, dense `(experts, m, n)` C-contiguous output or discrete output pointers (packed uint8 / int64 with jax x64 mode). The block-scaled backend's layouts are not expressible as JAX arrays and raise a clear error. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs.

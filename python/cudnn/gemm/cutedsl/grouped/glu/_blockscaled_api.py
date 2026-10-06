@@ -19,6 +19,8 @@ Discrete mode
 
 from __future__ import annotations
 
+from ..native_layout import LogicalTensor, native_compile, unwrap_tensor
+
 from .moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
 from ..backend_utils import rubin_single_group_offsets_kwarg
 from ..moe_utils import MoEWeightMode
@@ -165,7 +167,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         """
         from cudnn.tensor_adapter import detect_framework
 
-        if sample_a is not None and detect_framework(sample_a) != "torch":
+        if sample_a is not None and detect_framework(unwrap_tensor(sample_a)) != "torch":
             raise ValueError(
                 "GroupedGemmGluBlockScaledAPI supports torch tensors only: the block-scaled "
                 "scale-factor tensors use an MMA-interleaved layout that is not expressible as JAX arrays"
@@ -190,6 +192,21 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 raise ValueError("b_shape and b_dtype are required in discrete mode")
         else:
             raise ValueError("Provide either (sample_b, sample_sfb) for dense mode " "or (num_experts, b_shape, b_dtype) for discrete mode, but not both.")
+
+        self._native_samples = {
+            "a": sample_a,
+            "b": sample_b,
+            "sfb": sample_sfb,
+            "c": sample_c,
+            "d": sample_d,
+            "d_col": sample_d_col,
+            "sfa": sample_sfa,
+            "sfd_row_tensor": sample_sfd_row,
+            "sfd_col_tensor": sample_sfd_col,
+            "prob": sample_prob,
+            "bias": sample_bias,
+        }
+        self._native_samples = {name: tensor for name, tensor in self._native_samples.items() if isinstance(tensor, LogicalTensor)}
 
         # ---- Common tensor descriptors ----
         self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
@@ -923,7 +940,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                     "situ_beta2": cutlass.Float32(25.0),
                 }
             )
-        _compiled_kernel = cute.compile(gemm_glu, **compile_kwargs)
+        _compiled_kernel = native_compile(gemm_glu, compile_kwargs, self._native_samples)
+        self._native_samples = {}
 
         # Cache workspace pointer for the tensor_api closure
         cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator

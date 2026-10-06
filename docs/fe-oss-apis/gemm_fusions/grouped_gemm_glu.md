@@ -592,4 +592,40 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 
 ## Usage Examples
 
+### Explicit layouts over raw MXFP8 storage
+
+The Torch wrapper accepts the append-only optional argument `tensor_layouts`.
+Each mapping entry names an input argument and supplies
+`(logical_shape, logical_strides_in_elements, logical_dtype)`. For example,
+`"a_tensor": ((m, k, 1), (k, 1, m * k), torch.float8_e4m3fn)` binds a
+contiguous `uint8` activation buffer directly. Dense weights use the existing
+logical `(n, k, experts)` interpretation with strides `(k, 1, n * k)`.
+The declared shape and strides must describe the bytes already in storage;
+this interface performs no transpose, quantization, or scale-factor repacking.
+
+Native layout mode currently requires dense MXFP8 inputs, E8M0 scales, explicit
+FP8 `d_dtype`, `sf_vec_size=32`,
+and an `a_tensor` entry. Entries are accepted for `a_tensor`, `b_tensor`,
+`sfa_tensor`, `sfb_tensor`, `bias_tensor`, and `prob_tensor`. Scale-factor entries describe
+the existing six-dimensional MMA-interleaved logical layout over packed E8M0
+bytes. Other operands retain their existing contract. Storage must be
+contiguous CUDA memory, sufficiently large for the declared span, and aligned
+to 16 bytes. Only eight-bit logical types may reinterpret `uint8` storage.
+
+The wrapper returns C in natural `(m, n)` shape with the requested `c_dtype`
+(BF16 by default), and quantized D, D_col,
+SFD_row, and SFD_col as flat physical `uint8` buffers. D_col denotes column
+quantization; its data still has the same row-major interpretation as D.
+The raw storage and the runtime logical dimensions are passed separately to
+a compiled CuTe launcher, which constructs the tensor layouts from base
+pointers. The original GEMM kernel, math, activation, and scheduler are used.
+Changed token capacities reuse the compiled kernel under the existing dynamic
+shape policy. Existing calls without `tensor_layouts` retain their original
+output layout and dtype.
+
+Integrations can inspect
+`grouped_gemm_glu_wrapper_sm100.supports_tensor_layouts` once during
+initialization. This capability belongs to the Torch wrapper; it does not
+change the class API or add JAX raw-buffer support.
+
 For usage examples, see test cases in `test/python/gemm/cutedsl/test_grouped_gemm_glu.py` (dense mode, unified API) and `test/python/gemm/cutedsl/test_discrete_grouped_gemm_swiglu.py` (discrete mode).
